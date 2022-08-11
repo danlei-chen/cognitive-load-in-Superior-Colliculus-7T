@@ -1,0 +1,1433 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Oct  3 21:27:04 2020
+
+@author: chendanlei
+"""
+################# BELOW ARE DECODING SCRIPT COPIED BECAUSE CLUSTER HAS A PROBLEM OF IMPORTING DECODER #################
+################# https://github.com/nilearn/nilearn/blob/master/nilearn/decoding/decoder.py #################
+"""High-level decoding object that exposes standard classification and
+regression strategies such as SVM, LogisticRegression and Ridge, with optional
+feature selection, integrated hyper-parameter selection and aggregation
+strategy in which the best models within a cross validation loop are averaged.
+Also exposes a high-level method FREM that uses clustering and model
+ensembling to achieve state of the art performance
+"""
+# Authors: Yannick Schwartz
+#          Andres Hoyos-Idrobo
+#          Binh Nguyen <tuan-binh.nguyen@inria.fr>
+#          Thomas Bazeille
+#
+# License: simplified BSD
+
+import itertools
+import warnings
+
+import numpy as np
+from joblib import Parallel, delayed
+from sklearn import clone
+from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import RidgeClassifierCV, RidgeCV
+from sklearn.dummy import DummyRegressor, DummyClassifier
+from sklearn.model_selection import (LeaveOneGroupOut, ParameterGrid,
+                                     ShuffleSplit, StratifiedShuffleSplit,
+                                     check_cv)
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.svm import SVR, LinearSVC, l1_min_c
+from sklearn.utils import check_random_state
+from sklearn.utils.extmath import safe_sparse_dot
+from sklearn.utils.validation import check_is_fitted, check_X_y
+from sklearn.metrics import get_scorer
+
+from nilearn._utils import CacheMixin
+from nilearn._utils.cache_mixin import _check_memory
+from nilearn._utils.param_validation import check_feature_screening
+from nilearn.input_data.masker_validation import check_embedded_nifti_masker
+# from nilearn.regions.rena_clustering import ReNA
+
+try:
+    from sklearn.metrics import check_scoring
+except ImportError:
+    # for scikit-learn 0.18 and 0.19
+    from sklearn.metrics.scorer import check_scoring
+
+
+SUPPORTED_ESTIMATORS = dict(
+    svc_l1=LinearSVC(penalty='l1', dual=False, max_iter=1e4),
+    svc_l2=LinearSVC(penalty='l2', max_iter=1e4),
+    svc=LinearSVC(penalty='l2', max_iter=1e4),
+    logistic_l1=LogisticRegression(penalty='l1', solver='liblinear'),
+    logistic_l2=LogisticRegression(penalty='l2', solver='liblinear'),
+    logistic=LogisticRegression(penalty='l2', solver='liblinear'),
+    ridge_classifier=RidgeClassifierCV(),
+    ridge_regressor=RidgeCV(),
+    ridge=RidgeCV(),
+    svr=SVR(kernel='linear', max_iter=1e4),
+    dummy_classifier = DummyClassifier(strategy='prior',
+                                       random_state=0),
+    dummy_regressor = DummyRegressor(strategy='mean'),
+)
+
+
+def _check_param_grid(estimator, X, y, param_grid=None):
+    """Check param_grid and return sensible default if param_grid is None.
+    Parameters
+    -----------
+    estimator: str, optional
+        The estimator to choose among: 'svc', 'svc_l2', 'svc_l1', 'logistic',
+        'logistic_l1', 'logistic_l2', 'ridge', 'ridge_classifier',
+        'ridge_regressor', and 'svr'. Note that the 'svc' and 'svc_l2';
+        'logistic' and 'logistic_l2'; 'ridge' and 'ridge_regressor'
+        correspond to the same estimator. Default 'svc'.
+    X: list of Niimg-like objects
+        See http://nilearn.github.io/manipulating_images/input_output.html
+        Data on which model is to be fitted. If this is a list,
+        the affine is considered the same for all.
+    y: array or list of shape (n_samples)
+        The dependent variable (age, sex, IQ, yes/no, etc.).
+        Target variable to predict. Must have exactly as many elements as
+        3D images in niimg.
+    param_grid: dict of str to sequence, or sequence of such. Default None
+        The parameter grid to explore, as a dictionary mapping estimator
+        parameters to sequences of allowed values.
+        An empty dict signifies default parameters.
+        A sequence of dicts signifies a sequence of grids to search, and is
+        useful to avoid exploring parameter combinations that make no sense
+        or have no effect. See scikit-learn documentation for more information.
+        For Dummy estimators, parameter grid defaults to empty as these
+        estimators do not have hyperparameters to grid search.
+    Returns
+    -------
+    param_grid: dict of str to sequence, or sequence of such. Sensible default
+    dict has size 1 for linear models.
+    """
+    if param_grid is None:
+        param_grid = {}
+        # define loss function
+        if isinstance(estimator, LogisticRegression):
+            loss = 'log'
+        elif isinstance(estimator,
+                        (LinearSVC, RidgeCV, RidgeClassifierCV, SVR)):
+            loss = 'squared_hinge'
+        elif isinstance(estimator,
+                        (DummyClassifier, DummyRegressor)):
+            if estimator.strategy in ['constant', 'uniform']:
+                message = ('Dummy classification implemented only for strategies'
+                           ' "most_frequent", "prior", "stratified"')
+                raise NotImplementedError(message)
+        else:
+            raise ValueError(
+                "Invalid estimator. The supported estimators are: {}".format(
+                    list(SUPPORTED_ESTIMATORS.keys()))
+            )
+        # define sensible default for different types of estimators
+        if hasattr(estimator, 'penalty') and (estimator.penalty == 'l1'):
+            min_c = l1_min_c(X, y, loss=loss)
+        else:
+            min_c = 0.5
+
+        if not isinstance(estimator, (RidgeCV, RidgeClassifierCV,
+                                      DummyClassifier, DummyRegressor)):
+            param_grid['C'] = np.array([2, 20, 200]) * min_c
+        else:
+            param_grid = {}
+
+    return param_grid
+
+
+def _check_estimator(estimator):
+    if not isinstance(estimator, str):
+        warnings.warn('Use a custom estimator at your own risk '
+                      'of the process not working as intended.')
+    elif estimator in SUPPORTED_ESTIMATORS.keys():
+        estimator = SUPPORTED_ESTIMATORS.get(estimator)
+    else:
+        raise ValueError(
+            "Invalid estimator. Known estimators are: {}".format(
+                list(SUPPORTED_ESTIMATORS.keys()))
+        )
+
+    print(estimator)
+    return estimator
+
+
+def _parallel_fit(estimator, X, y, train, test, param_grid, is_classification,
+                  selector, scorer, mask_img, class_index,
+                  clustering_percentile):
+    """Find the best estimator for a fold within a job.
+    This function tries several parameters for the estimator for the train and
+    test fold provided and save the one that performs best.
+    Fit may be performed after some preprocessing step :
+    * clustering with ReNA if clustering_percentile < 100
+    * feature screening if screening_percentile < 100
+    """
+    X_train, y_train = X[train], y[train]
+    X_test, y_test = X[test], y[test]
+
+    # for FREM Classifier and Regressor : start by doing a quick ReNA
+    # clustering to reduce the number of feature by agglomerating similar ones
+
+    if clustering_percentile < 100:
+        n_clusters = int(X_train.shape[1] * clustering_percentile / 100.)
+        clustering = ReNA(mask_img, n_clusters=n_clusters, n_iter=20,
+                          threshold=1e-7, scaling=False)
+        X_train = clustering.fit_transform(X_train)
+        X_test = clustering.transform(X_test)
+
+    do_screening = (X_train.shape[1] > 100) and selector is not None
+
+    if do_screening:
+        X_train = selector.fit_transform(X_train, y_train)
+        X_test = selector.transform(X_test)
+
+    # If there is no parameter grid, then we use a suitable grid (by default)
+    param_grid = _check_param_grid(estimator, X_train, y_train, param_grid)
+    best_score = None
+    for param in ParameterGrid(param_grid):
+        estimator = clone(estimator).set_params(**param)
+        estimator.fit(X_train, y_train)
+
+        if is_classification:
+            score = scorer(estimator, X_test, y_test)
+            if hasattr(estimator, 'coef_') and np.all(estimator.coef_ == 0):
+                score = 0
+        else:  # regression
+            score = scorer(estimator, X_test, y_test)
+
+        # Store best parameters and estimator coefficients
+        if (best_score is None) or (score >= best_score):
+            best_score = score
+            if hasattr(estimator, 'coef_'):
+                best_coef = np.reshape(estimator.coef_, (1, -1))
+                best_intercept = estimator.intercept_
+                dummy_output = None
+            else:
+                best_coef, best_intercept = None, None
+                if isinstance(estimator, DummyClassifier):
+                    dummy_output = estimator.class_prior_
+                elif isinstance(estimator, DummyRegressor):
+                    dummy_output = estimator.constant_
+            best_param = param
+
+    if best_coef is not None:
+        if do_screening:
+            best_coef = selector.inverse_transform(best_coef)
+
+        if clustering_percentile < 100:
+            best_coef = clustering.inverse_transform(best_coef)
+
+    return class_index, best_coef, best_intercept, best_param, best_score, dummy_output
+
+
+class _BaseDecoder(LinearRegression, CacheMixin):
+    """A wrapper for popular classification/regression strategies in
+    neuroimaging.
+    The `BaseDecoder` object supports classification and regression methods.
+    It implements a model selection scheme that averages the best models
+    within a cross validation loop (a technique sometimes known as CV bagging).
+    The resulting average model is the one used as a classifier or a regressor.
+    This object also leverages the `NiftiMaskers` to provide a direct interface
+    with the Nifti files on disk.
+    Parameters
+    -----------
+    estimator: str, optional
+        The estimator to choose among: 'svc', 'svc_l2', 'svc_l1', 'logistic',
+        'logistic_l1', 'logistic_l2', 'ridge', 'ridge_classifier',
+        'ridge_regressor', and 'svr'. Note that the 'svc' and 'svc_l2';
+        'logistic' and 'logistic_l2'; 'ridge' and 'ridge_regressor',
+        correspond to the same estimator.
+        Dummy estimators are named as 'dummy_classifier', 'dummy_regressor'.
+        Default 'svc'.
+    mask: filename, Nifti1Image, NiftiMasker, or MultiNiftiMasker, optional
+        Mask to be used on data. If an instance of masker is passed,
+        then its mask and parameters will be used. If no mask is given, mask
+        will be computed automatically from provided images by an inbuilt
+        masker with default parameters. Refer to NiftiMasker or
+        MultiNiftiMasker to check for default parameters. Default None
+    cv: cross-validation generator or int, optional. Default 10
+        A cross-validation generator.
+        See: https://scikit-learn.org/stable/modules/cross_validation.html
+    param_grid: dict of str to sequence, or sequence of such. Default None
+        The parameter grid to explore, as a dictionary mapping estimator
+        parameters to sequences of allowed values.
+        None or an empty dict signifies default parameters.
+        A sequence of dicts signifies a sequence of grids to search, and is
+        useful to avoid exploring parameter combinations that make no sense
+        or have no effect. See scikit-learn documentation for more information,
+        for example: https://scikit-learn.org/stable/modules/grid_search.html
+        For Dummy estimators, parameter grid defaults to empty dictionary.
+    clustering_percentile: int, float, optional, in the [0, 100] Default: 10.
+        Percentile of features to keep after clustering. If it is lower
+        than 100, a ReNA clustering is performed as a first step of fit
+        to agglomerate similar features together. ReNA is typically efficient
+        for clustering_percentile equal to 10.
+    screening_percentile: int, float, optional, in the closed interval [0, 100]
+        The percentage of brain volume that will be kept with respect to a full
+        MNI template. In particular, if it is lower than 100, a univariate
+        feature selection based on the Anova F-value for the input data will be
+        perfomed. A float according to a percentile of the highest
+        scores. Default: 20.
+    scoring: str, callable or None, optional. Default None
+        The scoring strategy to use. See the scikit-learn documentation at
+        https://scikit-learn.org/stable/modules/model_evaluation.html#the-scoring-parameter-defining-model-evaluation-rules
+        If callable, takes as arguments the fitted estimator, the
+        test data (X_test) and the test target (y_test) if y is
+        not None.
+        e.g. scorer(estimator, X_test, y_test)
+        For regression, valid entries are: 'r2', 'neg_mean_absolute_error', or
+        'neg_mean_squared_error'. Default: 'r2'.
+        For classification, valid entries are: 'accuracy', 'f1', 'precision',
+        'recall' or 'roc_auc'. Default: 'roc_auc'.
+    smoothing_fwhm: float, optional. Default: None
+        If smoothing_fwhm is not None, it gives the size in millimeters of the
+        spatial smoothing to apply to the signal.
+    standardize: bool, optional. Default: True
+        If standardize is True, the time-series are centered and normed:
+        their variance is put to 1 in the time dimension.
+    target_affine: 3x3 or 4x4 matrix, optional. Default: None
+        This parameter is passed to image.resample_img. Please see the
+        related documentation for details.
+    target_shape: 3-tuple of int, optional. Default: None
+        This parameter is passed to image.resample_img. Please see the
+        related documentation for details.
+    low_pass: None or float, optional
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details
+    high_pass: None or float, optional
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details
+    t_r: float, optional. Default: None
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details.
+    mask_strategy: {'background' or 'epi'}, optional. Default: 'background'
+        The strategy used to compute the mask: use 'background' if your
+        images present a clear homogeneous background, and 'epi' if they
+        are raw EPI images. Depending on this value, the mask will be
+        computed from masking.compute_background_mask or
+        masking.compute_epi_mask.
+        This parameter will be ignored if a mask image is provided.
+    memory: instance of joblib.Memory or str
+        Used to cache the masking process.
+        By default, no caching is done. If a str is given, it is the
+        path to the caching directory.
+    memory_level: int, optional. Default: 0
+        Rough estimator of the amount of memory used by caching. Higher value
+        means more memory for caching.
+    n_jobs: int, optional. Default: 1.
+        The number of CPUs to use to do the computation. -1 means
+        'all CPUs'.
+    verbose: int, optional. Default: 0.
+        Verbosity level.
+    See Also
+    ------------
+    nilearn.decoding.Decoder: Classification strategies for Neuroimaging,
+    nilearn.decoding.DecoderRegressor: Regression strategies for Neuroimaging,
+    nilearn.decoding.FREMClassifier: State of the art classification pipeline
+        for Neuroimaging
+    nilearn.decoding.FREMRegressor: State of the art regression pipeline
+        for Neuroimaging
+    nilearn.decoding.SpaceNetClassifier: Graph-Net and TV-L1 priors/penalties
+    """
+
+    def __init__(self, estimator='svc', mask=None, cv=10, param_grid=None,
+                 clustering_percentile=100, screening_percentile=20,
+                 scoring=None, smoothing_fwhm=None, standardize=True,
+                 target_affine=None, target_shape=None,
+                 low_pass=None, high_pass=None, t_r=None,
+                 mask_strategy='background', is_classification=True,
+                 memory=None, memory_level=0, n_jobs=1, verbose=0):
+        self.estimator = estimator
+        self.mask = mask
+        self.cv = cv
+        self.param_grid = param_grid
+        self.screening_percentile = screening_percentile
+        self.scoring = scoring
+        self.is_classification = is_classification
+        self.clustering_percentile = clustering_percentile
+        self.smoothing_fwhm = smoothing_fwhm
+        self.standardize = standardize
+        self.target_affine = target_affine
+        self.target_shape = target_shape
+        self.mask_strategy = mask_strategy
+        self.low_pass = low_pass
+        self.high_pass = high_pass
+        self.t_r = t_r
+        self.memory = memory
+        self.memory_level = memory_level
+        self.n_jobs = n_jobs
+        self.verbose = verbose
+
+
+    def fit(self, X, y, groups=None):
+        """Fit the decoder (learner).
+        Parameters
+        ----------
+        X: list of Niimg-like objects
+            See http://nilearn.github.io/manipulating_images/input_output.html
+            Data on which model is to be fitted. If this is a list,
+            the affine is considered the same for all.
+        y: numpy.ndarray of shape=(n_samples) or list of length n_samples
+            The dependent variable (age, sex, IQ, yes/no, etc.).
+            Target variable to predict. Must have exactly as many elements as
+            3D images in niimg.
+        groups: None
+            Group labels for the samples used while splitting the dataset into
+            train/test set. Default None.
+            Note that this parameter must be specified in some scikit-learn
+            cross-validation generators to calculate the number of splits, e.g.
+            sklearn.model_selection.LeaveOneGroupOut or
+            sklearn.model_selection.LeavePGroupsOut.
+            For more details see
+            https://scikit-learn.org/stable/modules/cross_validation.html#cross-validation-iterators-for-grouped-data
+        Attributes
+        ----------
+        `masker_` : instance of NiftiMasker or MultiNiftiMasker
+            The NiftiMasker used to mask the data.
+        `mask_img_` : Nifti1Image
+            Mask computed by the masker object.
+        `classes_` : numpy.ndarray
+            Classes to predict. For classification only.
+        `screening_percentile_` : float
+            Screening percentile corrected according to volume of mask,
+            relative to the volume of standard brain.
+        `coef_` : numpy.ndarray, shape=(n_classes, n_features)
+            Contains the mean of the models weight vector across
+            fold for each class. Returns None for Dummy estimators.
+        `coef_img_` : dict of Nifti1Image
+            Dictionary containing `coef_` with class names as keys,
+            and `coef_` transformed in Nifti1Images as values. In the case of
+            a regression, it contains a single Nifti1Image at the key 'beta'.
+            Ignored if Dummy estimators are provided.
+        `intercept_` : ndarray, shape (nclasses,)
+            Intercept (a.k.a. bias) added to the decision function.
+            Ignored if Dummy estimators are provided.
+        `cv_` : list of pairs of lists
+            List of the (n_folds,) folds. For the corresponding fold,
+            each pair is composed of two lists of indices,
+            one for the train samples and one for the test samples.
+        `std_coef_` : numpy.ndarray, shape=(n_classes, n_features)
+            Contains the standard deviation of the models weight vector across
+            fold for each class. Note that folds are not independent, see
+            https://scikit-learn.org/stable/modules/cross_validation.html#cross-validation-iterators-for-grouped-data
+            Ignored if Dummy estimators are provided.
+        `std_coef_img_` : dict of Nifti1Image
+            Dictionary containing `std_coef_` with class names as keys,
+            and `coef_` transformed in Nifti1Image as values. In the case of
+            a regression, it contains a single Nifti1Image at the key 'beta'.
+            Ignored if Dummy estimators are provided.
+        `cv_params_` : dict of lists
+            Best point in the parameter grid for each tested fold
+            in the inner cross validation loop. The grid is empty
+            when Dummy estimators are provided.
+        'scorer_' : function
+            Scorer function used on the held out data to choose the best
+            parameters for the model.
+        `cv_scores_` : dict, (classes, n_folds)
+            Scores (misclassification) for each parameter, and on each fold
+        `n_outputs_` : int
+            Number of outputs (column-wise)
+        `dummy_output_`: ndarray, shape=(n_classes, 2) or shape=(1, 1) for regression
+            Contains dummy estimator attributes after class predictions using strategies
+            of DummyClassifier (class_prior) and DummyRegressor (constant)
+            from scikit-learn. This attribute is necessary for estimating class
+            predictions after fit. Returns None if non-dummy estimators are
+            provided.
+        """
+        self.estimator = _check_estimator(self.estimator)
+        self.memory_ = _check_memory(self.memory, self.verbose)
+
+        X = self._apply_mask(X)
+        X, y = check_X_y(X, y, dtype=np.float, multi_output=True)
+
+        if y.ndim == 1:
+            self.n_outputs_ = 1
+        else:
+            self.n_outputs_ = y.shape[1]
+
+        # Setup scorer
+        if self.scoring is not None:
+            self.scorer_ = check_scoring(self.estimator,
+                                         self.scoring)
+        else:
+            if self.is_classification:
+                self.scorer_ = get_scorer("accuracy")
+            else:
+                self.scorer_ = get_scorer("r2")
+
+        # Setup cross-validation object. Default is StratifiedKFold when groups
+        # is None. If groups is specified but self.cv is not set to custom CV
+        # splitter, default is LeaveOneGroupOut. If self.cv is manually set to
+        # a CV splitter object do check_cv regardless of groups parameter.
+        cv = self.cv
+        if (isinstance(cv, int) or cv is None) and groups is not None:
+            warnings.warn(
+                'groups parameter is specified but '
+                'cv parameter is not set to custom CV splitter. '
+                'Using default object LeaveOneGroupOut().'
+            )
+            cv_object = LeaveOneGroupOut()
+        else:
+            cv_object = check_cv(cv, y=y, classifier=self.is_classification)
+
+        self.cv_ = list(cv_object.split(X, y, groups=groups))
+
+        # Define the number problems to solve. In case of classification this
+        # number corresponds to the number of binary problems to solve
+        if self.is_classification:
+            y = self._binarize_y(y)
+        else:
+            y = y[:, np.newaxis]
+        if self.is_classification and self.n_classes_ > 2:
+            n_problems = self.n_classes_
+        else:
+            n_problems = 1
+
+        # Check if the size of the mask image and the number of features allow
+        # to perform feature screening.
+        selector = check_feature_screening(self.screening_percentile,
+                                           self.mask_img_,
+                                           self.is_classification)
+        # Return a suitable screening percentile according to the mask image
+        if hasattr(selector, 'percentile'):
+            self.screening_percentile_ = selector.percentile
+        elif self.screening_percentile is None:
+            self.screening_percentile_ = 100.0
+        else:
+            self.screening_percentile_ = self.screening_percentile
+
+        n_final_features = int(X.shape[1] * self.screening_percentile_
+                               * self.clustering_percentile / 10000)
+        if n_final_features < 50:
+            warnings.warn(
+                "After clustering and screening, the decoding model will "
+                "be trained only on {} features. ".format(n_final_features)
+                + "Consider raising clustering_percentile or "
+                + "screening_percentile parameters", UserWarning)
+
+        parallel = Parallel(n_jobs=self.n_jobs, verbose=2 * self.verbose)
+
+        parallel_fit_outputs = parallel(
+            delayed(self._cache(_parallel_fit))(
+                estimator=self.estimator,
+                X=X, y=y[:, c], train=train, test=test,
+                param_grid=self.param_grid,
+                is_classification=self.is_classification, selector=selector,
+                scorer=self.scorer_, mask_img=self.mask_img_, class_index=c,
+                clustering_percentile=self.clustering_percentile)
+            for c, (train, test) in itertools.product(
+                range(n_problems), self.cv_))
+
+        coefs, intercepts = self._fetch_parallel_fit_outputs(
+            parallel_fit_outputs, y, n_problems)
+
+        # Build the final model (the aggregated one)
+        if not isinstance(self.estimator, (DummyClassifier,
+                                           DummyRegressor)):
+            self.coef_ = np.vstack([np.mean(coefs[class_index], axis=0)
+                                    for class_index in self.classes_])
+            self.std_coef_ = np.vstack([np.std(coefs[class_index], axis=0)
+                                        for class_index in self.classes_])
+            self.intercept_ = np.hstack([np.mean(intercepts[class_index], axis=0)
+                                         for class_index in self.classes_])
+
+            self.coef_img_, self.std_coef_img_ = self._output_image(
+                self.classes_, self.coef_, self.std_coef_)
+
+            if self.is_classification and (self.n_classes_ == 2):
+                self.coef_ = self.coef_[0, :][np.newaxis, :]
+                self.intercept_ = self.intercept_[0]
+        else:
+            # For Dummy estimators
+            self.coef_ = None
+            self.dummy_output_ = np.vstack([np.mean(self.dummy_output_[class_index], axis=0)
+                                            for class_index in self.classes_])
+            if self.is_classification and (self.n_classes_ == 2):
+                if not self.n_outputs_ > 1:
+                    self.dummy_output_ = self.dummy_output_[0, :][np.newaxis, :]
+
+    def score(self, X, y, *args):
+        """Compute the prediction score using the scoring
+        metric defined by the scoring attribute.
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape = (n_samples, n_features)
+            Samples.
+        y : array-like
+            Target values.
+        args : Optional arguments that can be passed to
+            scoring metrics. Example: sample_weight.
+        Returns
+        -------
+        score : float
+            Prediction score.
+        """
+        check_is_fitted(self, "coef_")
+        check_is_fitted(self, "masker_")
+        return self.scorer_(self, X, y, *args)
+
+    def decision_function(self, X):
+        """Predict class labels for samples in X.
+        Parameters
+        ----------
+        X: list of Niimg-like objects
+            See
+            <http://nilearn.github.io/manipulating_images/input_output.html>
+            Data on prediction is to be made. If this is a list,
+            the affine is considered the same for all.
+        Returns
+        -------
+        y_pred: ndarray, shape (n_samples,)
+            Predicted class label per sample.
+        """
+        n_features = self.coef_.shape[1]
+        if X.shape[1] != n_features:
+            raise ValueError(
+                "X has {} features per sample; expecting {}".format(
+                    (X.shape[1], n_features)))
+
+        scores = safe_sparse_dot(X, self.coef_.T,
+                                 dense_output=True) + self.intercept_
+
+        return scores.ravel() if scores.shape[1] == 1 else scores
+
+    def predict(self, X):
+        """Predict a label for all X vectors indexed by the first axis.
+        Parameters
+        ----------
+        X: {array-like, sparse matrix}, shape = (n_samples, n_features)
+            Samples.
+        Returns
+        -------
+        array, shape=(n_samples,) if n_classes == 2 else (n_samples, n_classes)
+            Confidence scores per (sample, class) combination. In the binary
+            case, confidence score for self.classes_[1] where >0 means this
+            class would be predicted.
+        """
+
+        check_is_fitted(self, "coef_")
+        check_is_fitted(self, "masker_")
+
+        X = self.masker_.transform(X)
+        n_samples = X.shape[0]
+
+        if isinstance(self.estimator, (DummyClassifier, DummyRegressor)):
+            return self._predict_dummy(n_samples)
+
+        scores = self.decision_function(X)
+
+        if self.is_classification:
+            if len(scores.shape) == 1:
+                indices = (scores > 0).astype(np.int)
+            else:
+                indices = scores.argmax(axis=1)
+            return self.classes_[indices]
+
+        return scores
+
+    def _apply_mask(self, X):
+        # Nifti masking
+        self.masker_ = check_embedded_nifti_masker(self, multi_subject=False)
+        X = self.masker_.fit_transform(X)
+        self.mask_img_ = self.masker_.mask_img_
+
+        return X
+
+    def _fetch_parallel_fit_outputs(self, parallel_fit_outputs, y, n_problems):
+        """Fetch the outputs from parallel_fit to be ready for ensembling
+        Parameters
+        ----------
+        parallel_fit_outputs : list of tuples, each tuple contains results of
+            one _parallel_fit for each cv fold (and each classification in the
+            case of multiclass classification).
+        y : ndarray, shape = (n_samples, )
+            Vector of responses.
+        Returns
+        -------
+        coefs : dict
+            Coefficients for each classification/regression problem
+        intercepts : dict
+            Intercept for each classification/regression problem
+        """
+
+        coefs = {}
+        intercepts = {}
+        cv_scores = {}
+        self.cv_params_ = {}
+        self.dummy_output_ = {}
+        classes = self.classes_
+
+        for i, (class_index, coef, intercept, params,
+                scores, dummy_output) in enumerate(parallel_fit_outputs):
+
+            coefs.setdefault(classes[class_index], []).append(coef)
+            intercepts.setdefault(classes[class_index], []).append(intercept)
+
+            cv_scores.setdefault(classes[class_index], []).append(scores)
+
+            self.cv_params_.setdefault(classes[class_index], {})
+            if isinstance(self.estimator, (DummyClassifier, DummyRegressor)):
+                self.dummy_output_.setdefault(classes[class_index],
+                                              []).append(dummy_output)
+            else:
+                self.dummy_output_.setdefault(classes[class_index],
+                                              []).append(None)
+            for k in params:
+                self.cv_params_[classes[class_index]].setdefault(
+                    k, []).append(params[k])
+ 
+            if (n_problems <= 2) and self.is_classification:
+                # Binary classification
+                other_class = np.setdiff1d(classes, classes[class_index])[0]
+                if coef is not None:
+                    coefs.setdefault(other_class, []).append(-coef)
+                    intercepts.setdefault(other_class, []).append(-intercept)
+                else:
+                    coefs.setdefault(other_class, []).append(None)
+                    intercepts.setdefault(other_class, []).append(None)
+
+                cv_scores.setdefault(other_class, []).append(scores)
+                self.cv_params_[other_class] = self.cv_params_[
+                    classes[class_index]]
+                if isinstance(self.estimator, (DummyClassifier, DummyRegressor)):
+                    self.dummy_output_.setdefault(other_class,
+                                                  []).append(dummy_output)
+                else:
+                    self.dummy_output_.setdefault(other_class, []).append(None)
+
+        self.cv_scores_ = cv_scores
+
+        return coefs, intercepts
+
+    def _output_image(self, classes, coefs, std_coef):
+        coef_img = {}
+        std_coef_img = {}
+        for class_index, coef, std in zip(classes, coefs, std_coef):
+            coef_img[class_index] = self.masker_.inverse_transform(coef)
+            std_coef_img[class_index] = self.masker_.inverse_transform(std)
+
+        return coef_img, std_coef_img
+
+    def _binarize_y(self, y):
+        """Helper function invoked just before fitting a classifier."""
+        y = np.array(y)
+
+        # encode target classes as -1 and 1
+        self._enc = LabelBinarizer(pos_label=1, neg_label=-1)
+        y = self._enc.fit_transform(y)
+        self.classes_ = self._enc.classes_
+        self.n_classes_ = len(self.classes_)
+        return y
+
+    def _predict_dummy(self, n_samples):
+        """Non-sparse scikit-learn based prediction steps for classification
+           and regression"""
+        dummy_output = self.dummy_output_
+
+        if isinstance(self.estimator, DummyClassifier):
+            estimator_params = self.estimator.get_params()
+            strategy = estimator_params['strategy']
+            if strategy in ['most_frequent', 'prior']:
+                scores = np.tile([dummy_output[k].argmax() for
+                                  k in range(self.n_outputs_)], [n_samples, 1])
+            elif strategy == 'stratified':
+                rs = check_random_state(0)
+                proba = []
+                for k in range(self.n_outputs_):
+                    out = rs.multinomial(1, dummy_output[k], size=n_samples)
+                    out = out.astype(np.float64)
+                    proba.append(out)
+                scores = np.vstack([proba[k].argmax(axis=1) for
+                                    k in range(self.n_outputs_)]).T
+        elif isinstance(self.estimator, DummyRegressor):
+                scores = np.full((n_samples, self.n_outputs_), self.dummy_output_,
+                                  dtype=np.array(self.dummy_output_).dtype)
+        return scores.ravel() if scores.shape[1] == 1 else scores
+
+
+class Decoder(_BaseDecoder):
+    """A wrapper for popular classification strategies in neuroimaging.
+    The `Decoder` object supports classification methods.
+    It implements a model selection scheme that averages the best models
+    within a cross validation loop. The resulting average model is the
+    one used as a classifier. This object also leverages the`NiftiMaskers` to
+    provide a direct interface with the Nifti files on disk.
+    Parameters
+    -----------
+    estimator: str, optional
+        The estimator to choose among: 'svc', 'svc_l2', 'svc_l1', 'logistic',
+        'logistic_l1', 'logistic_l2' and 'ridge_classifier'. Note that
+        'svc' and 'svc_l2'; 'logistic' and 'logistic_l2' correspond to the same
+        estimator. Dummy classifier is named as 'dummy_classifier'. Default 'svc'.
+    mask: filename, Nifti1Image, NiftiMasker, or MultiNiftiMasker, optional
+        Mask to be used on data. If an instance of masker is passed,
+        then its mask and parameters will be used. If no mask is given, mask
+        will be computed automatically from provided images by an inbuilt
+        masker with default parameters. Refer to NiftiMasker or
+        MultiNiftiMasker to check for default parameters. Default None
+    cv: cross-validation generator or int, optional (default 10)
+        A cross-validation generator.
+        See: https://scikit-learn.org/stable/modules/cross_validation.html
+    param_grid: dict of str to sequence, or sequence of such. Default None
+        The parameter grid to explore, as a dictionary mapping estimator
+        parameters to sequences of allowed values.
+        None or an empty dict signifies default parameters.
+        A sequence of dicts signifies a sequence of grids to search, and is
+        useful to avoid exploring parameter combinations that make no sense
+        or have no effect. See scikit-learn documentation for more information,
+        for example: https://scikit-learn.org/stable/modules/grid_search.html
+        For DummyClassifier, parameter grid defaults to empty dictionary, class
+        predictions are estimated using default strategy.
+    screening_percentile: int, float, optional, in the closed interval [0, 100]
+        The percentage of brain volume that will be kept with respect to a full
+        MNI template. In particular, if it is lower than 100, a univariate
+        feature selection based on the Anova F-value for the input data will be
+        performed. A float according to a percentile of the highest
+        scores. Default: 20.
+    scoring: str, callable or None, optional. Default: 'roc_auc'
+        The scoring strategy to use. See the scikit-learn documentation at
+        https://scikit-learn.org/stable/modules/model_evaluation.html#the-scoring-parameter-defining-model-evaluation-rules
+        If callable, takes as arguments the fitted estimator, the
+        test data (X_test) and the test target (y_test) if y is
+        not None.
+        e.g. scorer(estimator, X_test, y_test)
+        For classification, valid entries are: 'accuracy', 'f1', 'precision',
+        'recall' or 'roc_auc'. Default: 'roc_auc'.
+    smoothing_fwhm: float, optional. Default: None
+        If smoothing_fwhm is not None, it gives the size in millimeters of the
+        spatial smoothing to apply to the signal.
+    standardize: bool, optional. Default: True
+        If standardize is True, the time-series are centered and normed:
+        their variance is put to 1 in the time dimension.
+    target_affine: 3x3 or 4x4 matrix, optional. Default: None
+        This parameter is passed to image.resample_img. Please see the
+        related documentation for details.
+    target_shape: 3-tuple of int, optional. Default: None
+        This parameter is passed to image.resample_img. Please see the
+        related documentation for details.
+    low_pass: None or float, optional
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details
+    high_pass: None or float, optional
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details
+    t_r: float, optional. Default: None
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details.
+    mask_strategy: {'background' or 'epi'}, optional. Default: 'background'
+        The strategy used to compute the mask: use 'background' if your
+        images present a clear homogeneous background, and 'epi' if they
+        are raw EPI images. Depending on this value, the mask will be
+        computed from masking.compute_background_mask or
+        masking.compute_epi_mask.
+        This parameter will be ignored if a mask image is provided.
+    memory: instance of joblib.Memory or str
+        Used to cache the masking process.
+        By default, no caching is done. If a str is given, it is the
+        path to the caching directory.
+    memory_level: int, optional. Default: 0
+        Rough estimator of the amount of memory used by caching. Higher value
+        means more memory for caching.
+    n_jobs: int, optional. Default: 1.
+        The number of CPUs to use to do the computation. -1 means
+        'all CPUs'.
+    verbose: int, optional. Default: 0.
+        Verbosity level.
+    See Also
+    ------------
+    nilearn.decoding.DecoderRegressor: regression strategies for Neuro-imaging,
+    nilearn.decoding.FREMClassifier: State of the art classification pipeline
+        for Neuroimaging
+    nilearn.decoding.SpaceNetClassifier: Graph-Net and TV-L1 priors/penalties
+    """
+
+    def __init__(self, estimator='svc', mask=None, cv=10, param_grid=None,
+                 screening_percentile=20, scoring='roc_auc',
+                 smoothing_fwhm=None, standardize=True, target_affine=None,
+                 target_shape=None, mask_strategy='background',
+                 low_pass=None, high_pass=None, t_r=None, memory=None,
+                 memory_level=0, n_jobs=1, verbose=0):
+        super().__init__(
+            estimator=estimator, mask=mask, cv=cv, param_grid=param_grid,
+            screening_percentile=screening_percentile, scoring=scoring,
+            smoothing_fwhm=smoothing_fwhm, standardize=standardize,
+            target_affine=target_affine, target_shape=target_shape,
+            mask_strategy=mask_strategy, low_pass=low_pass,
+            high_pass=high_pass, t_r=t_r, memory=memory,
+            is_classification=True, memory_level=memory_level,
+            verbose=verbose, n_jobs=n_jobs)
+
+
+class DecoderRegressor(_BaseDecoder):
+    """A wrapper for popular regression strategies in neuroimaging.
+    The `DecoderRegressor` object supports regression methods.
+    It implements a model selection scheme that averages the best models
+    within a cross validation loop. The resulting average model is the
+    one used as a regressor. This object also leverages the `NiftiMaskers`
+    to provide a direct interface with the Nifti files on disk.
+    Parameters
+    -----------
+    estimator: str, optional
+        The estimator to choose among: 'ridge', 'ridge_regressor', and 'svr'.
+        Note that the 'ridge' and 'ridge_regressor' correspond to the same
+        estimator. Dummy regressor is named as 'dummy_regressor'. Default 'svr'.
+    mask: filename, Nifti1Image, NiftiMasker, or MultiNiftiMasker, optional
+        Mask to be used on data. If an instance of masker is passed,
+        then its mask and parameters will be used. If no mask is given, mask
+        will be computed automatically from provided images by an inbuilt
+        masker with default parameters. Refer to NiftiMasker or
+        MultiNiftiMasker to check for default parameters. Default None
+    cv: cross-validation generator or int, optional (default 10)
+        A cross-validation generator.
+        See: https://scikit-learn.org/stable/modules/cross_validation.html
+    param_grid: dict of str to sequence, or sequence of such. Default None
+        The parameter grid to explore, as a dictionary mapping estimator
+        parameters to sequences of allowed values.
+        None or an empty dict signifies default parameters.
+        A sequence of dicts signifies a sequence of grids to search, and is
+        useful to avoid exploring parameter combinations that make no sense
+        or have no effect. See scikit-learn documentation for more information,
+        for example: https://scikit-learn.org/stable/modules/grid_search.html
+        For DummyRegressor, parameter grid defaults to empty dictionary, class
+        predictions are estimated using default strategy.
+    screening_percentile: int, float, optional, in the closed interval [0, 100]
+        The percentage of brain volume that will be kept with respect to a full
+        MNI template. In particular, if it is lower than 100, a univariate
+        feature selection based on the Anova F-value for the input data will be
+        performed. A float according to a percentile of the highest
+        scores. Default: 20.
+    scoring: str, callable or None, optional. Default: 'r2'
+        The scoring strategy to use. See the scikit-learn documentation at
+        https://scikit-learn.org/stable/modules/model_evaluation.html#the-scoring-parameter-defining-model-evaluation-rules
+        If callable, takes as arguments the fitted estimator, the
+        test data (X_test) and the test target (y_test) if y is
+        not None.
+        e.g. scorer(estimator, X_test, y_test)
+        For regression, valid entries are: 'r2', 'neg_mean_absolute_error',
+        or 'neg_mean_squared_error'. Default: 'r2'.
+    smoothing_fwhm: float, optional. Default: None
+        If smoothing_fwhm is not None, it gives the size in millimeters of the
+        spatial smoothing to apply to the signal.
+    standardize: bool, optional. Default: True
+        If standardize is True, the time-series are centered and normed:
+        their variance is put to 1 in the time dimension.
+    target_affine: 3x3 or 4x4 matrix, optional. Default: None
+        This parameter is passed to image.resample_img. Please see the
+        related documentation for details.
+    target_shape: 3-tuple of int, optional. Default: None
+        This parameter is passed to image.resample_img. Please see the
+        related documentation for details.
+    low_pass: None or float, optional
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details
+    high_pass: None or float, optional
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details
+    t_r: float, optional. Default: None
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details.
+    mask_strategy: {'background' or 'epi'}, optional. Default: 'background'
+        The strategy used to compute the mask: use 'background' if your
+        images present a clear homogeneous background, and 'epi' if they
+        are raw EPI images. Depending on this value, the mask will be
+        computed from masking.compute_background_mask or
+        masking.compute_epi_mask.
+        This parameter will be ignored if a mask image is provided.
+    memory: instance of joblib.Memory or str
+        Used to cache the masking process.
+        By default, no caching is done. If a str is given, it is the
+        path to the caching directory.
+    memory_level: int, optional. Default: 0
+        Rough estimator of the amount of memory used by caching. Higher value
+        means more memory for caching.
+    n_jobs: int, optional. Default: 1.
+        The number of CPUs to use to do the computation. -1 means
+        'all CPUs'.
+    verbose: int, optional. Default: 0.
+        Verbosity level.
+    See Also
+    ------------
+    nilearn.decoding.Decoder: classification strategies for Neuroimaging,
+    nilearn.decoding.FREMRegressor: State of the art regression pipeline
+        for Neuroimaging
+    nilearn.decoding.SpaceNetClassifier: Graph-Net and TV-L1 priors/penalties
+    """
+
+    def __init__(self, estimator='svr', mask=None, cv=10, param_grid=None,
+                 screening_percentile=20, scoring='r2',
+                 smoothing_fwhm=None, standardize=True, target_affine=None,
+                 target_shape=None, mask_strategy='background',
+                 low_pass=None, high_pass=None, t_r=None, memory=None,
+                 memory_level=0, n_jobs=1, verbose=0):
+        self.classes_ = ['beta']
+
+        super().__init__(
+            estimator=estimator, mask=mask, cv=cv, param_grid=param_grid,
+            screening_percentile=screening_percentile, scoring=scoring,
+            smoothing_fwhm=smoothing_fwhm, standardize=standardize,
+            target_affine=target_affine, target_shape=target_shape,
+            low_pass=low_pass, high_pass=high_pass, t_r=t_r,
+            mask_strategy=mask_strategy, memory=memory,
+            is_classification=False, memory_level=memory_level,
+            verbose=verbose, n_jobs=n_jobs)
+
+
+class FREMRegressor(_BaseDecoder):
+    """ State of the art decoding scheme applied to usual regression estimators.
+    FREM uses an implicit spatial regularization through fast clustering and
+    aggregates a high number of estimators trained on various splits of the
+    training set, thus returning a very robust decoder at a lower computational
+    cost than other spatially regularized methods.[1]_.
+    Parameters
+    -----------
+    estimator : str, optional
+        The estimator to choose among: 'ridge', 'ridge_regressor', and 'svr'.
+        Note that the 'ridge' and 'ridge_regressor' correspond to the same
+        estimator. Default 'svr'.
+    mask : filename, Nifti1Image, NiftiMasker, or MultiNiftiMasker, optional
+        Mask to be used on data. If an instance of masker is passed,
+        then its mask and parameters will be used. If no mask is given, mask
+        will be computed automatically from provided images by an inbuilt
+        masker with default parameters. Refer to NiftiMasker or
+        MultiNiftiMasker to check for default parameters. Default None
+    cv : int or cross-validation generator, optional (default 30)
+        If int, number of shuffled splits returned, which is usually the right
+        way to train many different classifiers. A good trade-off between
+        stability of the aggregated model and computation time is 50 splits.
+        Shuffled splits are seeded by default for reproducibility.
+        Can also be a cross-validation generator.
+    param_grid : dict of str to sequence, or sequence of such. Default None
+        The parameter grid to explore, as a dictionary mapping estimator
+        parameters to sequences of allowed values.
+        None or an empty dict signifies default parameters.
+        A sequence of dicts signifies a sequence of grids to search, and is
+        useful to avoid exploring parameter combinations that make no sense
+        or have no effect. See scikit-learn documentation for more information,
+        for example: https://scikit-learn.org/stable/modules/grid_search.html
+    clustering_percentile : int, float, optional, in closed interval [0, 100]
+        Used to perform a fast ReNA clustering on input data as a first step of
+        fit. It agglomerates similar features together to reduce their number
+        by this percentile. ReNA is typically efficient for cluster_percentile
+        equal to 10. Default: 10.
+    screening_percentile : int, float, optional, in closed interval [0, 100]
+        The percentage of brain volume that will be kept with respect to a full
+        MNI template. In particular, if it is lower than 100, a univariate
+        feature selection based on the Anova F-value for the input data will be
+        performed. A float according to a percentile of the highest
+        scores. Default: 20.
+    scoring : str, callable or None, optional. Default: 'r2'
+        The scoring strategy to use. See the scikit-learn documentation at
+        https://scikit-learn.org/stable/modules/model_evaluation.html#the-scoring-parameter-defining-model-evaluation-rules
+        If callable, takes as arguments the fitted estimator, the
+        test data (X_test) and the test target (y_test) if y is
+        not None.
+        e.g. scorer(estimator, X_test, y_test)
+        For regression, valid entries are: 'r2', 'neg_mean_absolute_error',
+        or 'neg_mean_squared_error'. Default: 'r2'.
+    smoothing_fwhm : float, optional. Default: None
+        If smoothing_fwhm is not None, it gives the size in millimeters of the
+        spatial smoothing to apply to the signal.
+    standardize : bool, optional. Default: True
+        If standardize is True, the time-series are centered and normed:
+        their variance is put to 1 in the time dimension.
+    target_affine : 3x3 or 4x4 matrix, optional. Default: None
+        This parameter is passed to image.resample_img. Please see the
+        related documentation for details.
+    target_shape : 3-tuple of int, optional. Default: None
+        This parameter is passed to image.resample_img. Please see the
+        related documentation for details.
+    low_pass : None or float, optional
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details
+    high_pass : None or float, optional
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details
+    t_r : float, optional. Default: None
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details.
+    mask_strategy : {'background' or 'epi'}, optional. Default: 'background'
+        The strategy used to compute the mask: use 'background' if your
+        images present a clear homogeneous background, and 'epi' if they
+        are raw EPI images. Depending on this value, the mask will be
+        computed from masking.compute_background_mask or
+        masking.compute_epi_mask.
+        This parameter will be ignored if a mask image is provided.
+    memory : instance of joblib.Memory or str
+        Used to cache the masking process.
+        By default, no caching is done. If a str is given, it is the
+        path to the caching directory.
+    memory_level : int, optional. Default: 0
+        Rough estimator of the amount of memory used by caching. Higher value
+        means more memory for caching.
+    n_jobs : int, optional. Default: 1.
+        The number of CPUs to use to do the computation. -1 means
+        'all CPUs'.
+    verbose : int, optional. Default: 0.
+        Verbosity level.
+    References
+    ----------
+    * A. Hoyos-Idrobo, G. Varoquaux, J. Kahn and B. Thirion, "FReM –
+      scalable and stable decoding with fast regularized ensemble of models"
+      in NeuroImage, Elsevier, 2017  pp.1-16, 11 October 2017.
+      https://hal.archives-ouvertes.fr/hal-01615015/
+    See Also
+    ------------
+    nilearn.decoding.DecoderRegressor: Regression strategies for Neuroimaging,
+    nilearn.decoding.FREMClassifier: State of the art classification pipeline
+        for Neuroimaging
+    """
+
+    def __init__(self, estimator='svr', mask=None, cv=30, param_grid=None,
+                 clustering_percentile=10, screening_percentile=20,
+                 scoring='r2', smoothing_fwhm=None, standardize=True,
+                 target_affine=None, target_shape=None,
+                 mask_strategy='background', low_pass=None, high_pass=None,
+                 t_r=None, memory=None,
+                 memory_level=0, n_jobs=1, verbose=0):
+        self.classes_ = ['beta']
+
+        if isinstance(cv, int):
+            cv = ShuffleSplit(cv, random_state=0)
+
+        super().__init__(
+            estimator=estimator, mask=mask, cv=cv, param_grid=param_grid,
+            clustering_percentile=clustering_percentile,
+            screening_percentile=screening_percentile, scoring=scoring,
+            smoothing_fwhm=smoothing_fwhm, standardize=standardize,
+            target_affine=target_affine, target_shape=target_shape,
+            low_pass=low_pass, high_pass=high_pass, t_r=t_r,
+            mask_strategy=mask_strategy, memory=memory,
+            is_classification=False, memory_level=memory_level,
+            verbose=verbose, n_jobs=n_jobs)
+
+
+class FREMClassifier(_BaseDecoder):
+    """ State of the art decoding scheme applied to usual classifiers.
+    FREM uses an implicit spatial regularization through fast clustering and
+    aggregates a high number of estimators trained on various splits of the
+    training set, thus returning a very robust decoder at a lower computational
+    cost than other spatially regularized methods.[1]_.
+    Parameters
+    -----------
+    estimator : str, optional
+        The estimator to choose among: 'svc', 'svc_l2', 'svc_l1', 'logistic',
+        'logistic_l1', 'logistic_l2' and 'ridge_classifier'. Note that
+        'svc' and 'svc_l2'; 'logistic' and 'logistic_l2' correspond to the same
+        estimator. Default 'svc'.
+    mask : filename, Nifti1Image, NiftiMasker, or MultiNiftiMasker, optional
+        Mask to be used on data. If an instance of masker is passed,
+        then its mask and parameters will be used. If no mask is given, mask
+        will be computed automatically from provided images by an inbuilt
+        masker with default parameters. Refer to NiftiMasker or
+        MultiNiftiMasker to check for default parameters. Default None
+    cv : int or cross-validation generator, optional (default 30)
+        If int, number of stratified shuffled splits returned, which is usually
+        the right way to train many different classifiers. A good trade-off
+        between stability of the aggregated model and computation time is
+        50 splits. Shuffled splits are seeded by default for reproducibility.
+        Can also be a cross-validation generator.
+    param_grid : dict of str to sequence, or sequence of such. Default None
+        The parameter grid to explore, as a dictionary mapping estimator
+        parameters to sequences of allowed values.
+        None or an empty dict signifies default parameters.
+        A sequence of dicts signifies a sequence of grids to search, and is
+        useful to avoid exploring parameter combinations that make no sense
+        or have no effect. See scikit-learn documentation for more information,
+        for example: https://scikit-learn.org/stable/modules/grid_search.html
+    clustering_percentile : int, float, optional, in closed interval [0, 100]
+        Used to perform a fast ReNA clustering on input data as a first step of
+        fit. It agglomerates similar features together to reduce their number
+        down to this percentile. ReNA is typically efficient for
+        cluster_percentile equal to 10. Default: 10.
+    screening_percentile : int, float, optional, in closed interval [0, 100]
+        The percentage of brain volume that will be kept with respect to a full
+        MNI template. In particular, if it is lower than 100, a univariate
+        feature selection based on the Anova F-value for the input data will be
+        performed. A float according to a percentile of the highest
+        scores. Default: 20.
+    scoring : str, callable or None, optional. Default: 'roc_auc'
+        The scoring strategy to use. See the scikit-learn documentation at
+        https://scikit-learn.org/stable/modules/model_evaluation.html#the-scoring-parameter-defining-model-evaluation-rules
+        If callable, takes as arguments the fitted estimator, the
+        test data (X_test) and the test target (y_test) if y is
+        not None.
+        e.g. scorer(estimator, X_test, y_test)
+        For classification, valid entries are: 'accuracy', 'f1', 'precision',
+        'recall' or 'roc_auc'. Default: 'roc_auc'.
+    smoothing_fwhm : float, optional. Default: None
+        If smoothing_fwhm is not None, it gives the size in millimeters of the
+        spatial smoothing to apply to the signal.
+    standardize : bool, optional. Default: True
+        If standardize is True, the time-series are centered and normed:
+        their variance is put to 1 in the time dimension.
+    target_affine : 3x3 or 4x4 matrix, optional. Default: None
+        This parameter is passed to image.resample_img. Please see the
+        related documentation for details.
+    target_shape : 3-tuple of int, optional. Default: None
+        This parameter is passed to image.resample_img. Please see the
+        related documentation for details.
+    low_pass : None or float, optional
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details
+    high_pass : None or float, optional
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details
+    t_r : float, optional. Default: None
+        This parameter is passed to signal.clean. Please see the related
+        documentation for details.
+    mask_strategy : {'background' or 'epi'}, optional. Default: 'background'
+        The strategy used to compute the mask: use 'background' if your
+        images present a clear homogeneous background, and 'epi' if they
+        are raw EPI images. Depending on this value, the mask will be
+        computed from masking.compute_background_mask or
+        masking.compute_epi_mask.
+        This parameter will be ignored if a mask image is provided.
+    memory : instance of joblib.Memory or str
+        Used to cache the masking process.
+        By default, no caching is done. If a str is given, it is the
+        path to the caching directory.
+    memory_level : int, optional. Default: 0
+        Rough estimator of the amount of memory used by caching. Higher value
+        means more memory for caching.
+    n_jobs : int, optional. Default: 1.
+        The number of CPUs to use to do the computation. -1 means
+        'all CPUs'.
+    verbose : int, optional. Default: 0.
+        Verbosity level.
+    References
+    ----------
+    * A. Hoyos-Idrobo, G. Varoquaux, J. Kahn and B. Thirion, "FReM –
+      scalable and stable decoding with fast regularized ensemble of models"
+      in NeuroImage, Elsevier, 2017  pp.1-16, 11 October 2017.
+      https://hal.archives-ouvertes.fr/hal-01615015/
+    See Also
+    ------------
+    nilearn.decoding.Decoder: Classification strategies for Neuroimaging,
+    nilearn.decoding.FREMRegressor: State of the art regression pipeline
+        for Neuroimaging
+    """
+
+    def __init__(self, estimator='svc', mask=None, cv=30,
+                 param_grid=None, clustering_percentile=10,
+                 screening_percentile=20, scoring='roc_auc',
+                 smoothing_fwhm=None, standardize=True, target_affine=None,
+                 target_shape=None, mask_strategy='background',
+                 low_pass=None, high_pass=None, t_r=None, memory=None,
+                 memory_level=0, n_jobs=1, verbose=0):
+        if isinstance(cv, int):
+            cv = StratifiedShuffleSplit(cv, random_state=0)
+
+        super().__init__(
+            estimator=estimator, mask=mask, cv=cv, param_grid=param_grid,
+            clustering_percentile=clustering_percentile,
+            screening_percentile=screening_percentile, scoring=scoring,
+            smoothing_fwhm=smoothing_fwhm, standardize=standardize,
+            target_affine=target_affine, target_shape=target_shape,
+            mask_strategy=mask_strategy, memory=memory, is_classification=True,
+            memory_level=memory_level, verbose=verbose, n_jobs=n_jobs)
+
+################# END OF DECODING SCRIPT COPIED BECAUSE CLUSTER HAS A PROBLEM OF IMPORTING DECODER #################
+################# https://github.com/nilearn/nilearn/blob/master/nilearn/decoding/decoder.py #################
+        
+import pandas as pd
+import nibabel as nib
+import numpy as np
+import nipype.pipeline.engine as pe
+import nipype.interfaces.fsl as fsl
+import os
+import glob
+from nilearn.image import resample_img
+from nilearn import plotting
+from nilearn.image import mean_img
+from nilearn.input_data import NiftiMasker
+import matplotlib.pyplot as plt
+import statistics 
+from datetime import date
+import math
+from nilearn.image import concat_imgs, mean_img
+# from nilearn.decoding import Decoder
+
+######
+proj = os.environ.get("PROJNAME")
+topic = os.environ.get("topic")
+clfLabel1 = os.environ.get("task1Label")
+clfLabel2 = os.environ.get("task2Label")
+base_dir='/scratch/'
+mask_filename= glob.glob(base_dir+'roi/Template_6_resampled_25thresh_bin.nii.gz')[0]
+output_dir = '/scratch/output/'
+cope_files1 = glob.glob('/scratch/data/'+proj+'/SC_warp/2_USneg_cope/warped_files/*cope2.nii.gz')
+cope_files2 = glob.glob('/scratch/data/'+proj+'/SC_warp/3_USneu_cope/warped_files/*cope3.nii.gz')
+# proj = 'emoAvd_CSUSnegneu'
+# topic = 'emo_SVMaffectCLF_SC'
+# clfLabel1 = 'aversive'
+# clfLabel2 = 'neutral'
+# base_dir='/Users/chendanlei/Desktop/'
+# mask_filename= glob.glob('/Users/chendanlei/Desktop/U01/ROI/subject_SC_mask/subject_SC_mask/emoAvd/avg_template/Template_6_resampled_25thresh_bin.nii.gz')[0]
+# output_dir = '/Users/chendanlei/Google Drive/U01/AffPainTask_connectivity/analysis/MVPA/'+topic+'/'
+# cope_files1 = glob.glob('/Users/chendanlei/Desktop/U01/level1_files/'+proj+'/SC_warp/'+'*'+'/*cope2.nii.gz')
+# cope_files2 = glob.glob('/Users/chendanlei/Desktop/U01/level1_files/'+proj+'/SC_warp/'+'*'+'/*cope3.nii.gz')
+######
+fold_num_list=[4,10,80]
+output_df= pd.DataFrame(columns = [str(i)+' folds' for i in fold_num_list])#two columns for k fold and two for leave one out
+# feature_selection = False
+# if feature_selection:
+#     feature_selection_condition = ['Q1', 'Q4']
+    
+output_event_name = output_dir+topic+'_MVPA_event'
+output_name = output_dir+topic+'_MVPA_classification'
+print('*************************************************')
+print('*************************************************')
+print(topic)
+print('*************************************************')
+print('*************************************************')
+
+# # read previous files and leave out masks that are already processed
+# roi_done = 'None'
+# try:
+#     old_data = pd.read_table(glob.glob(output_dir+'*MVPA_classification_2020-10-*.tsv')[-1], sep='\t')
+#     roi_done = old_data['roi'].tolist()
+#     print('ROI done already')
+#     print(roi_done)
+# except:
+#     print('no privious file')
+
+#loop through all mask input
+print('-----------------------------------------------')
+print('-----------------------------------------------')
+print(mask_filename)
+print('-----------------------------------------------')
+print('-----------------------------------------------')
+
+cope_files1.sort()
+cope_files2.sort()
+all_files = cope_files1+cope_files2
+concat_img = concat_imgs(all_files)
+event_files = pd.DataFrame(np.array([np.concatenate([np.repeat(clfLabel1,len(cope_files1)), np.repeat(clfLabel2,len(cope_files2))]), 
+                           ['run-'+i.split('/')[-1].split('run-')[-1].split('_cope')[0] for i in all_files], 
+                           [i.split('/')[-1].split('wdata_')[-1].split('_run')[0] for i in all_files]]).T, 
+                         columns=['labels','run', 'subject'])
+#apply mask on combined image
+# np.sum(nib.load(mask_filename).get_fdata())
+masker = NiftiMasker(mask_img=mask_filename, standardize=False)
+concat_img_masked = masker.fit_transform(concat_img)
+
+print('masked combined image shape:')
+print(concat_img_masked.shape)
+# x=masker.inverse_transform(combined_data_masked)
+# nib.save(x, combined_data_file_name)
+print('event file shape:')
+print(event_files.shape)
+condition = event_files['labels']
+session = event_files['subject']
+event_files.to_csv((output_event_name+'.tsv'),index=True,sep='\t')
+
+# #feature selection - restrict the analysis to certain conditions
+# if feature_selection:
+#     condition_mask = combined_event['labels'].isin(feature_selection_condition)
+#     combined_data_masked = combined_data_masked[np.array(condition_mask)]
+#     print(combined_data_masked.shape)
+
+#########different methods of prediction########
+# k-fold loop
+from sklearn.svm import SVC
+svc = SVC(kernel='linear')
+
+# from sklearn.model_selection import KFold
+# cv = KFold(n_splits=fold_num)
+# # The "cv" object's split method can now accept data and create a
+# # generator which can yield the splits.
+# fold_predict = []
+# for train, test in cv.split(X=combined_data_masked):
+#     condition_masked = condition.values[train]
+#     svc.fit(combined_data_masked[train], condition_masked, groups=session_label)
+#     prediction = svc.predict(combined_data_masked[test])
+#     fold_predict.append((prediction == condition.values[test]).sum()/ float(len(condition.values[test])))
+# print('*************************')
+# print(str(fold_num)+' folds loop prediction')
+# print(fold_predict)
+# print('mean: '+ str(statistics.mean(fold_predict)))
+# print('*************************')
+# file.write('\n') 
+# if statistics.mean(fold_predict)>0.5:
+#     file.write('***********************************')
+# file.write(str(fold_num)+' folds loop prediction'+'\n') 
+# file.writelines("%s " % i for i in fold_predict)
+# file.write('\nMEAN: '+ str(statistics.mean(fold_predict))+'\n')
+# file.write('SE: '+ str(statistics.stdev(fold_predict)/math.sqrt(max(session_label)))+'\n')
+
+# #similar k-fold method using packages skilearn 
+# print('k-fold running')
+# from sklearn.model_selection import KFold
+# from sklearn.model_selection import cross_val_score
+# for fold_num in fold_num_list:
+#     cv = KFold(n_splits=fold_num)
+#     cv_score = cross_val_score(svc, concat_img_masked, condition, cv=cv, groups=session)
+#     # print('*************************')
+#     # print(str(fold_num)+' folds prediction:')
+#     # print(cv_score)
+#     # print('mean: '+ str(statistics.mean(cv_score)))
+#     # print('*************************')
+#     k_mean = statistics.mean(cv_score)
+#     k_se = statistics.stdev(cv_score)/math.sqrt(len(np.unique(session)))
+
+#similar k-fold method using packages nilearn decoder 
+print('k-fold running')
+from sklearn.model_selection import KFold
+for fold_num in fold_num_list:
+    cv = KFold(n_splits=fold_num)
+    decoder = Decoder(estimator='svc', mask=mask_filename, standardize=True,
+                  screening_percentile=5, scoring='accuracy', cv=cv)
+    decoder.fit(concat_img, condition, groups=session)
+    print(decoder.cv_scores_[clfLabel1])
+    print(decoder.cv_scores_[clfLabel2])
+    # #dummy classifier to compare with
+    # dummy_classifier = DummyClassifier()
+    # dummy_scores = cross_val_score(dummy_classifier,concat_img_masked, condition, cv=cv,groups=session, scoring="accuracy",)
+    
+    output_df= pd.DataFrame(columns = [str(fold_num)+' folds'])#two columns for k fold and two for leave one out
+    output_df[str(fold_num)+' folds'] = decoder.cv_scores_[clfLabel1]
+    output_df.to_csv((output_name+'_'+str(fold_num)+'folds.tsv'),index=True,sep='\t')
+    
+    weight_img = decoder.coef_img_[clfLabel1]
+    nib.save(weight_img, output_dir+clfLabel1+'_weights_'+topic+'_'+str(fold_num)+'folds.nii.gz')
+    weight_img = decoder.coef_img_[clfLabel2]
+    nib.save(weight_img, output_dir+clfLabel2+'_weights_'+topic+'_'+str(fold_num)+'folds.nii.gz')
+    # from nilearn.plotting import plot_stat_map, show
+    # plot_stat_map(weight_img, title='SVM weights')
+    # show()
+
+
+
+
+
+
+
+# #leave one out
+# print('leave-one-out running')
+# from sklearn.model_selection import LeaveOneGroupOut
+# from sklearn.model_selection import cross_val_score
+# cv = LeaveOneGroupOut()
+# cv_score = cross_val_score(svc, combined_data_masked, condition, cv=cv, groups=session_label,)
+# # print('*************************')
+# # print('leave one out prediction:')
+# # print(cv_score)
+# # print('mean: '+ str(statistics.mean(cv_score)))
+# # print('*************************')
+# file.write('\n') 
+# if statistics.mean(cv_score)>0.5:
+#     file.write('***********************************')
+# file.write('leave one out prediction'+'\n') 
+# file.writelines("%s " % i for i in cv_score)
+# loo_mean = statistics.mean(cv_score)
+# file.write('\nMEAN: '+ str(loo_mean)+'\n')
+# loo_se = statistics.stdev(cv_score)/math.sqrt(max(session_label))
+# file.write('SE: '+ str(loo_se)+'\n')
+
+# output_df.loc[len(output_df)] = [mask_filename.split('/')[-1], k_mean, k_se, loo_mean, loo_se]
+
+
+
+
+
+
